@@ -3,6 +3,7 @@ import atexit
 import contextlib
 import copy
 import json
+import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath
@@ -198,6 +199,10 @@ class LocalConversation(BaseConversation):
     # it must skip re-acquiring the lock the run loop holds while blocked
     # awaiting that tool (#3485).
     _step_holds_state_lock: bool
+    # Messages accepted while a step held the state lock, waiting to be appended
+    # at the next step boundary. See send_message()/_drain_inbox_locked().
+    _inbox: list[tuple[Message, str | None]]
+    _inbox_lock: threading.Lock
     # Plugin lazy loading state
     _plugin_specs: list[PluginSource] | None
     _resolved_plugins: list[ResolvedPluginSource] | None
@@ -316,6 +321,8 @@ class LocalConversation(BaseConversation):
         self._arun_task = None
         self._cancel_token = None
         self._step_holds_state_lock = False
+        self._inbox = []
+        self._inbox_lock = threading.Lock()
 
         # Store plugin specs for lazy loading (no IO in constructor)
         # Plugins will be loaded on first run() or send_message() call
@@ -1828,45 +1835,118 @@ class LocalConversation(BaseConversation):
         assert message.role == "user", (
             "Only user messages are allowed to be sent to the agent."
         )
-        with self._state:
-            if self._state.execution_status in (
-                ConversationExecutionStatus.FINISHED,
-                ConversationExecutionStatus.STUCK,
-            ):
-                self._state.execution_status = (
-                    ConversationExecutionStatus.IDLE
-                )  # new message resets terminal states
-
-            activated_skill_names: list[str] = []
-            extended_content: list[TextContent] = []
-
-            # Handle per-turn user message (i.e., knowledge agent trigger)
-            if self.agent.agent_context:
-                ctx = self.agent.agent_context.get_user_message_suffix(
-                    user_message=message,
-                    # We skip skills that were already activated
-                    skip_skill_names=self._state.activated_knowledge_skills,
-                )
-                # TODO(calvin): we need to update
-                # self._state.activated_knowledge_skills
-                # so condenser can work
-                if ctx:
-                    content, activated_skill_names = ctx
-                    logger.debug(
-                        f"Got augmented user message content: {content}, "
-                        f"activated skills: {activated_skill_names}"
-                    )
-                    extended_content.append(content)
-                    self._state.activated_knowledge_skills.extend(activated_skill_names)
-
-            user_msg_event = MessageEvent(
-                source="user",
-                llm_message=message,
-                activated_skills=activated_skill_names,
-                extended_content=extended_content,
-                sender=sender,
+        # A step in flight holds the state lock for the whole of astep(). The LLM
+        # round-trip already releases it (_released_state_lock_during_io), but TOOL
+        # execution does not — so a message sent while a tool runs would block here
+        # for the tool's full duration. A `terminal` command that retries for 23
+        # minutes made the agent look silent for 23 minutes; the model was fine, the
+        # inbox was shut.
+        #
+        # Accept the message without the lock and let the run loop append it at the
+        # next step boundary. The two halves are separable: accepting must be
+        # instant, but INSERTING has to happen at a safe point in the event log —
+        # dropping a user message between an assistant tool_call and its tool result
+        # produces a message sequence providers reject.
+        #
+        # Same condition as switch_llm's skip_lock (#3485): the run loop holds the
+        # lock AND we are not that thread. During the LLM call the flag is False, so
+        # that path stays synchronous exactly as it is today.
+        if self._step_holds_state_lock and not self._state.owned():
+            with self._inbox_lock:
+                self._inbox.append((message, sender))
+            logger.info(
+                "Message accepted while a step is running; it will reach the agent "
+                "at the next step boundary."
             )
-            self._on_event(user_msg_event)
+            return
+
+        with self._state:
+            self._append_user_message_locked(message, sender)
+
+    def _append_user_message_locked(
+        self, message: Message, sender: str | None = None
+    ) -> None:
+        """Append a user message. The caller MUST hold the state lock.
+
+        Split out of :meth:`send_message` so the synchronous path and the inbox
+        drain build the identical event — including knowledge-skill activation,
+        which is easy to lose when a second append path is added.
+        """
+        if self._state.execution_status in (
+            ConversationExecutionStatus.FINISHED,
+            ConversationExecutionStatus.STUCK,
+        ):
+            self._state.execution_status = (
+                ConversationExecutionStatus.IDLE
+            )  # new message resets terminal states
+
+        activated_skill_names: list[str] = []
+        extended_content: list[TextContent] = []
+
+        # Handle per-turn user message (i.e., knowledge agent trigger)
+        if self.agent.agent_context:
+            ctx = self.agent.agent_context.get_user_message_suffix(
+                user_message=message,
+                # We skip skills that were already activated
+                skip_skill_names=self._state.activated_knowledge_skills,
+            )
+            # TODO(calvin): we need to update
+            # self._state.activated_knowledge_skills
+            # so condenser can work
+            if ctx:
+                content, activated_skill_names = ctx
+                logger.debug(
+                    f"Got augmented user message content: {content}, "
+                    f"activated skills: {activated_skill_names}"
+                )
+                extended_content.append(content)
+                self._state.activated_knowledge_skills.extend(activated_skill_names)
+
+        user_msg_event = MessageEvent(
+            source="user",
+            llm_message=message,
+            activated_skills=activated_skill_names,
+            extended_content=extended_content,
+            sender=sender,
+        )
+        self._on_event(user_msg_event)
+
+    def _drain_inbox_locked(self) -> None:
+        """Append everything accepted mid-step. The caller MUST hold the state lock.
+
+        Called at the top of every run-loop iteration, which is the safe insertion
+        point: no action is awaiting its observation there, so the resulting message
+        sequence is always one a provider will accept.
+
+        Order is preserved, and the inbox lock is never held across ``_on_event`` —
+        that would put a callback (persistence, webhooks) inside a lock a caller
+        touches on the hot path.
+        """
+        while True:
+            with self._inbox_lock:
+                if not self._inbox:
+                    return
+                message, sender = self._inbox.pop(0)
+            self._append_user_message_locked(message, sender)
+
+    def _inbox_has_pending(self) -> bool:
+        """Whether a message accepted mid-step is still waiting to be appended."""
+        with self._inbox_lock:
+            return bool(self._inbox)
+
+    def _drain_inbox_on_exit(self) -> None:
+        """Append anything still in the inbox when a run loop exits.
+
+        The loop drains at the top of each iteration, but it can also leave from the
+        bottom (awaiting confirmation, budget, iteration cap, an error). Before the
+        inbox, a sender blocked on the state lock would append its message the moment
+        the loop let go; draining here keeps that guarantee, so an accepted message is
+        always in the event log once run()/arun() returns.
+        """
+        if not self._inbox_has_pending():
+            return
+        with self._state:
+            self._drain_inbox_locked()
 
     def _on_event_with_state_lock(self, event: Event) -> None:
         """Emit an event while holding the conversation state lock."""
@@ -1935,6 +2015,11 @@ class LocalConversation(BaseConversation):
             while True:
                 logger.debug(f"Conversation run iteration {iteration}")
                 with self._state:
+                    # Anything that arrived while the previous step held the lock.
+                    # run() and arun() must behave identically here: a message sent
+                    # during a sync step is accepted the same way and must land the
+                    # same way.
+                    self._drain_inbox_locked()
                     # Pause attempts to acquire the state lock
                     # Before value can be modified step can be taken
                     # Ensure step conditions are checked when lock is already acquired
@@ -2088,6 +2173,7 @@ class LocalConversation(BaseConversation):
             ) from e
         finally:
             self._cancel_token = None
+            self._drain_inbox_on_exit()
 
     @observe(name="conversation.arun")
     async def arun(self) -> None:
@@ -2159,6 +2245,10 @@ class LocalConversation(BaseConversation):
                 acp_step_user_message_id: str | None = None
                 acp_step_user_message: MessageEvent | None = None
                 with self._state:
+                    # Anything that arrived while the previous step held the lock.
+                    # Before the status checks below, so a message that resets
+                    # FINISHED -> IDLE is seen by this iteration rather than the next.
+                    self._drain_inbox_locked()
                     if self._state.execution_status in [
                         ConversationExecutionStatus.PAUSED,
                         ConversationExecutionStatus.STUCK,
@@ -2613,6 +2703,7 @@ class LocalConversation(BaseConversation):
             if self._cancel_token is not None and not self._cancel_token.is_cancelled:
                 self._cancel_token = None
             self._arun_task = None
+            self._drain_inbox_on_exit()
 
     def set_confirmation_policy(self, policy: ConfirmationPolicyBase) -> None:
         """Set the confirmation policy and store it in conversation state."""

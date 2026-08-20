@@ -118,10 +118,12 @@ class _InjectingSyncLLM(LLM):
                 target=lambda: convo.send_message("second message")
             ).start()
 
-            # Wait until the sender is queued on the FIFO lock, so the run loop
+            # Wait until the sender is queued — on the FIFO lock, or (Ergatis
+            # patch: lock-free inbox) in the conversation's inbox, which the run
+            # loop drains at the top of the next iteration — so the run loop
             # provably can't overtake it — deterministic, no sleep-and-hope.
             deadline = time.monotonic() + 5.0
-            while not lock._waiters:
+            while not (lock._waiters or convo._inbox_has_pending()):
                 assert time.monotonic() < deadline, "send_message never queued"
                 time.sleep(0.001)
             self._probe["sender_enqueued"] = True
@@ -169,7 +171,8 @@ def test_sync_run_absorbs_message_sent_during_step(tmp_path):
 
     convo.run()
 
-    # Lock held across the sync step, so send_message() had to wait.
+    # Lock held across the sync step, so send_message() had to wait (or, with
+    # the inbox, was accepted and deferred to the step boundary).
     assert llm._probe["locked_during_call"] is True
     assert llm._probe["sender_enqueued"] is True
 

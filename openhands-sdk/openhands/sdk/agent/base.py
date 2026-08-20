@@ -286,6 +286,28 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
         ),
     )
 
+    require_finish_tool: bool = Field(
+        default=False,
+        description=(
+            "When True, a plain-text response does NOT end the conversation; only an "
+            "explicit finish tool call does. Lets the agent answer a question, or ask "
+            "one, and keep working — without this, 'reply to the human' and 'stop "
+            "working' are the same statement. Ignored when no finish tool is "
+            "available, so an agent is never trapped without an exit."
+        ),
+    )
+    max_consecutive_prose_steps: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "With require_finish_tool, how many message-only steps in a row the "
+            "agent may take before the conversation finishes anyway. A model that "
+            "has stopped calling tools is stuck, and left alone it will monologue "
+            "until the iteration budget runs out. Reset by any tool call, and by "
+            "the human speaking — a back-and-forth is not a monologue."
+        ),
+    )
+
     # Runtime materialized tools; private and non-serializable
     _tools: dict[str, ToolDefinition] = PrivateAttr(default_factory=dict)
     _initialized: bool = PrivateAttr(default=False)

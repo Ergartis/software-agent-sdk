@@ -12,9 +12,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from openhands.sdk.conversation.state import ConversationExecutionStatus
-from openhands.sdk.event import MessageEvent
+from openhands.sdk.event import ActionEvent, MessageEvent
 from openhands.sdk.llm import LLMResponse, Message, TextContent
 from openhands.sdk.logger import get_logger
+from openhands.sdk.tool.builtins.finish import FinishTool
 
 
 if TYPE_CHECKING:
@@ -24,7 +25,6 @@ if TYPE_CHECKING:
         LocalConversation,
     )
     from openhands.sdk.critic.base import CriticBase, CriticResult
-    from openhands.sdk.event import ActionEvent
     from openhands.sdk.llm import (
         MessageToolCall,
         ReasoningItemModel,
@@ -87,6 +87,8 @@ class _AgentProtocol(Protocol):
     """Subset of ``Agent`` that ``ResponseDispatchMixin`` depends on."""
 
     critic: CriticBase | None
+    require_finish_tool: bool
+    max_consecutive_prose_steps: int
 
     def _get_action_event(
         self,
@@ -127,6 +129,29 @@ class _AgentProtocol(Protocol):
     ) -> CriticResult | None: ...
 
 
+def _consecutive_agent_prose_steps(state: ConversationState) -> int:
+    """Message-only agent turns since the agent last acted, or the human last spoke.
+
+    Derived from the event log rather than counted into a field, for two reasons. The
+    log is what gets persisted and replayed, so a resumed conversation gets the same
+    answer as a live one — a counter would silently reset on resume. And ``state`` is a
+    frozen-ish pydantic model shared across threads; the run loop already treats its
+    event list as the single source of truth for what has happened.
+
+    A human message resets the count: a back-and-forth is a conversation, and the guard
+    exists for a model talking to itself.
+    """
+    count = 0
+    for event in reversed(state.events):
+        if isinstance(event, MessageEvent):
+            if event.source != "agent":
+                break
+            count += 1
+        elif isinstance(event, ActionEvent):
+            break
+    return count
+
+
 class ResponseDispatchMixin:
     """Handler methods for each ``LLMResponseType``. Mixed into ``Agent``.
 
@@ -136,6 +161,9 @@ class ResponseDispatchMixin:
     # Declared for pyright — the actual implementations live on Agent.
     if TYPE_CHECKING:
         critic: CriticBase | None
+        require_finish_tool: bool
+        max_consecutive_prose_steps: int
+        _tools: dict[str, object]
 
         def _get_action_event(
             self,
@@ -287,11 +315,49 @@ class ResponseDispatchMixin:
         state: ConversationState,
         on_event: ConversationCallbackType,
     ) -> None:
-        """Handle LLM response with text content — finishes conversation."""
+        """Handle an LLM response with text content.
+
+        By default this finishes the conversation: prose means the agent has nothing
+        further to do and is handing back to the human.
+
+        With ``require_finish_tool`` the two are separated — prose is a *reply*, and
+        only an explicit finish tool call ends the run. That is what lets an agent
+        answer a question mid-task and carry on working, which it otherwise cannot
+        do: answering would be quitting.
+        """
         self._emit_message_event(message, llm_response, conversation, on_event)
         self._maybe_emit_vllm_tokens(llm_response, on_event)
-        logger.debug("LLM produced a message response - awaits user input")
-        state.execution_status = ConversationExecutionStatus.FINISHED
+
+        # An agent with no finish tool has prose as its ONLY exit. Honouring the flag
+        # there would leave it running until something else killed it.
+        if not (self.require_finish_tool and self._has_finish_tool()):
+            logger.debug("LLM produced a message response - awaits user input")
+            state.execution_status = ConversationExecutionStatus.FINISHED
+            return
+
+        prose_steps = _consecutive_agent_prose_steps(state)
+        if prose_steps >= self.max_consecutive_prose_steps:
+            # A model that has stopped calling tools is stuck, not deliberating. Left
+            # alone it monologues until the iteration budget dies, which costs a tenant
+            # real money and reads as a hang.
+            logger.info(
+                "agent produced %d consecutive message-only responses "
+                "(limit %d) - finishing",
+                prose_steps,
+                self.max_consecutive_prose_steps,
+            )
+            state.execution_status = ConversationExecutionStatus.FINISHED
+            return
+
+        logger.debug(
+            "LLM produced a message response - keeps working (%d/%d prose steps)",
+            prose_steps,
+            self.max_consecutive_prose_steps,
+        )
+
+    def _has_finish_tool(self) -> bool:
+        """Whether this agent has a way to end the conversation other than prose."""
+        return FinishTool.name in self._tools
 
     def _handle_no_content_response(
         self,

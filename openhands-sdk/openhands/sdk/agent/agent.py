@@ -15,9 +15,11 @@ from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.critic_mixin import CriticMixin
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.agent.response_dispatch import (
+    REPLY_DIRECTIVE,
     LLMResponseType,
     ResponseDispatchMixin,
     classify_response,
+    reply_is_owed,
 )
 from openhands.sdk.agent.stream_context import StreamContext
 from openhands.sdk.agent.utils import (
@@ -786,10 +788,24 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             f"{json.dumps([m.model_dump() for m in _messages[1:]], indent=2)}"
         )
 
+        # One tool-free step when a person is waiting on an answer. With no tools on
+        # the table the model has nothing to return but prose, so the reply becomes
+        # certain instead of merely allowed — see reply_is_owed(). require_finish_tool
+        # is what makes that prose a reply rather than the end of the run, and the
+        # agent still has its finish tool (_has_finish_tool reads the agent's tools,
+        # not this call's), so the next step resumes work normally.
+        _owes_reply = reply_is_owed(state)
+        if _owes_reply:
+            logger.info("A human is waiting on an answer; taking one tool-free step.")
+            # Ephemeral: steers this turn without entering the event log.
+            _messages = _messages + [
+                Message(role="user", content=[TextContent(text=REPLY_DIRECTIVE)])
+            ]
+
         try:
             llm_response = self.llm.generate(
                 messages=_messages,
-                tools=list(self.tools_map.values()),
+                tools=[] if _owes_reply else list(self.tools_map.values()),
                 store=False,
                 add_security_risk_prediction=True,
                 on_token=stream.token_callback,
@@ -994,6 +1010,14 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             f"{json.dumps([m.model_dump() for m in _messages[1:]], indent=2)}"
         )
 
+        # See the sync path in step() for why the tools come off for one step.
+        _owes_reply = reply_is_owed(state)
+        if _owes_reply:
+            logger.info("A human is waiting on an answer; taking one tool-free step.")
+            _messages = _messages + [
+                Message(role="user", content=[TextContent(text=REPLY_DIRECTIVE)])
+            ]
+
         try:
             # Release the state lock for just the network wait so send_message()
             # and state snapshots aren't blocked for the whole response. No-op
@@ -1001,7 +1025,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             async with conversation._released_state_lock_during_io():
                 llm_response = await self.llm.agenerate(
                     messages=_messages,
-                    tools=list(self.tools_map.values()),
+                    tools=[] if _owes_reply else list(self.tools_map.values()),
                     store=False,
                     add_security_risk_prediction=True,
                     on_token=stream.token_callback,

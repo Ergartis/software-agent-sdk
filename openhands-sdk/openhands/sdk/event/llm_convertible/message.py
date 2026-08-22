@@ -56,6 +56,22 @@ class MessageEvent(LLMConvertibleEvent):
         ),
     )
 
+    expects_reply: bool = Field(
+        default=False,
+        description=(
+            "True when a human sent this MID-RUN and is waiting for an answer. Set in "
+            "LocalConversation._append_user_message_locked(), which both paths a "
+            "send_message() can take — straight through, or via the inbox — "
+            "share, so they cannot disagree about it.\n\n"
+            "It exists to separate that from the other user-role messages the loop "
+            "appends to itself — the opening task, a malformed-tool-call correction, "
+            "a content-policy nudge — which look identical in the event log and must "
+            "NOT make the agent stop and talk. The agent forces exactly one tool-free "
+            "step when it sees this, which "
+            "is what makes an answer certain rather than merely permitted."
+        ),
+    )
+
     critic_result: CriticResult | None = Field(
         default=None,
         description="Optional critic evaluation of this message and preceding history.",

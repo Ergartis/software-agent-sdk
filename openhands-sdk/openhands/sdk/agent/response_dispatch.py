@@ -134,7 +134,8 @@ def _consecutive_agent_prose_steps(state: ConversationState) -> int:
 
     Derived from the event log rather than counted into a field, for two reasons. The
     log is what gets persisted and replayed, so a resumed conversation gets the same
-    answer as a live one — a counter would silently reset on resume. And ``state`` is a
+    answer as a live one — a counter would silently reset on resume. And ``state``
+    is a
     frozen-ish pydantic model shared across threads; the run loop already treats its
     event list as the single source of truth for what has happened.
 
@@ -150,6 +151,75 @@ def _consecutive_agent_prose_steps(state: ConversationState) -> int:
         elif isinstance(event, ActionEvent):
             break
     return count
+
+
+# Appended to the message list for the one tool-free step, and never written to the
+# event log — it steers that single turn without becoming part of the conversation's
+# history.
+#
+# Removing the tools is what makes speech the only possible output; this is what makes
+# it an ANSWER. Without it, live run 6ea4eeb5 (2026-08-21) took three forced steps and
+# produced two empty responses and one line of unrelated narration, while the single
+# good answer that run produced came from an ordinary step where the model happened to
+# volunteer prose. An empty turn is worse than none: it burns a step, and the SDK then
+# has to nudge the model back into calling tools.
+#
+# Phrased as the supervisor speaking, not as a system rule, because the model is being
+# asked to do something it is otherwise trained out of mid-task: stop and talk.
+REPLY_DIRECTIVE = (
+    "The person supervising this run is waiting for an answer to the message above.\n\n"
+    "Reply to them now, in plain text. You have no tools this turn, so a tool call is "
+    "not "
+    "available to you — and you do not need one: answer from what you already know.\n"
+    "- Say what you have finished, what you are doing right now, and what is left.\n"
+    "- If they asked something specific, answer that first and directly.\n"
+    "- If they changed what they want, say so in one line and follow the new "
+    "instruction.\n"
+    "- Do not describe your next tool call. Do not return an empty message.\n\n"
+    "Replying does NOT end your turn or finish the task — you carry on working "
+    "immediately "
+    "afterwards, with your tools back."
+)
+
+
+def reply_is_owed(state: ConversationState) -> bool:
+    """Whether a person is waiting on an answer the agent has not given yet.
+
+    True when the most recent *conversational* turn is a ``MessageEvent`` a human sent
+    mid-run (``expects_reply``) and the agent has not spoken since. Only messages count:
+    the debt is settled by answering, not by carrying on working, so the tool events an
+    in-flight step writes after the question do not clear it. One reply flips it False,
+    so it cannot loop, and a backlog of questions costs one answer rather than one each.
+
+    Derived from the log rather than a flag on the agent for the same reason as
+    :func:`_consecutive_agent_prose_steps`: the log is what is persisted and replayed,
+    so a resumed conversation reaches the same answer as a live one.
+
+    Why this exists: ``require_finish_tool`` made a mid-run reply *possible* —
+    prose stopped meaning "finished". It did not make one happen. Observed on
+    2026-08-20 across two runs (tasks eb38f9e2 and 79d8dcc4): the message was
+    delivered into the LLM's context as a proper user turn, the system prompt invited
+    an answer in as many words, and the agent produced 84 tool calls and zero prose.
+    Mid-task, with tools on the table, acting always outranks answering. Permission is
+    not obligation; the caller turns this into obligation by taking the tools away for
+    exactly one step.
+    """
+    for event in reversed(state.events):
+        if not isinstance(event, MessageEvent):
+            # Tool traffic is irrelevant here, and treating it as an answer is the bug
+            # this comment exists to prevent. A message accepted mid-step is
+            # appended the moment it arrives, and the step already in flight then
+            # writes its own ActionEvent and ObservationEvent AFTER it — so the
+            # question is almost never the newest event by the time the next step
+            # looks. Stopping at the first
+            # ActionEvent made this dead on every real run while the unit tests, whose
+            # LLM only ever produced prose, stayed green.
+            continue
+        if event.source == "agent":
+            return False  # the agent has spoken since; the debt is settled
+        if event.source == "user":
+            return event.expects_reply
+    return False
 
 
 class ResponseDispatchMixin:

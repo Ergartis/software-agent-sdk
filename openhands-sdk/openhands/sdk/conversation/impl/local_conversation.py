@@ -1749,12 +1749,32 @@ class LocalConversation(BaseConversation):
             return
 
         with self._state:
-            self._append_user_message_locked(message, sender)
+            self._append_user_message_locked(message, sender, from_human=True)
 
     def _append_user_message_locked(
-        self, message: Message, sender: str | None = None
+        self,
+        message: Message,
+        sender: str | None = None,
+        from_human: bool = False,
     ) -> None:
         """Append a user message. The caller MUST hold the state lock.
+
+        ``from_human`` marks the two paths a ``send_message()`` call can take —
+        straight
+        through here, or via the inbox — as opposed to the user-role messages the loop
+        appends to itself (a malformed-tool-call correction, a content-policy nudge),
+        which must never make the agent stop and talk.
+
+        Whether the sender is actually *waiting* is decided here rather than by the
+        caller, so both paths reach the same answer. The test is "has the agent acted
+        yet": before the first ``ActionEvent`` this is the opening task and answering it
+        would burn a turn talking before any work started; after it, a person has
+        interrupted a run and is owed a reply.
+
+        Deciding it in the caller is what broke this the first time — the inbox path
+        set
+        it and the direct path did not, and the direct path is the common one, because
+        ``_step_holds_state_lock`` is False for the whole LLM round-trip.
 
         Split out of :meth:`send_message` so the synchronous path and the inbox
         drain build the identical event — including knowledge-skill activation,
@@ -1791,12 +1811,26 @@ class LocalConversation(BaseConversation):
                 extended_content.append(content)
                 self._state.activated_knowledge_skills.extend(activated_skill_names)
 
+        # "Has this conversation already been given its task?" Anything after that is
+        # someone interrupting, and is owed an answer; the task itself is not.
+        #
+        # Two signals, either one is enough, because the opening message does not always
+        # arrive the same way: agent-server can seed it with the start body rather
+        # than a
+        # send_message(). A prior user message means the task has landed; a prior
+        # ActionEvent means the agent is already working, which settles it regardless.
+        already_underway = any(
+            (isinstance(e, MessageEvent) and e.source == "user")
+            or isinstance(e, ActionEvent)
+            for e in self._state.events
+        )
         user_msg_event = MessageEvent(
             source="user",
             llm_message=message,
             activated_skills=activated_skill_names,
             extended_content=extended_content,
             sender=sender,
+            expects_reply=from_human and already_underway,
         )
         self._on_event(user_msg_event)
 
@@ -1816,7 +1850,8 @@ class LocalConversation(BaseConversation):
                 if not self._inbox:
                     return
                 message, sender = self._inbox.pop(0)
-            self._append_user_message_locked(message, sender)
+            # Everything in the inbox came from send_message(), i.e. from a person.
+            self._append_user_message_locked(message, sender, from_human=True)
 
     def _on_event_with_state_lock(self, event: Event) -> None:
         """Emit an event while holding the conversation state lock."""

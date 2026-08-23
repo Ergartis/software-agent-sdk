@@ -471,6 +471,18 @@ class SetConfirmationPolicyRequest(BaseModel):
     policy: ConfirmationPolicyBase = Field(description="The confirmation policy to set")
 
 
+class RejectPendingActionsRequest(BaseModel):
+    """Payload to reject the actions a conversation is waiting for confirmation on."""
+
+    reason: str = Field(
+        default="User rejected the action",
+        description=(
+            "Handed to the agent as a UserRejectObservation, so a denial reads as a "
+            "redirection it can act on rather than a dead end."
+        ),
+    )
+
+
 class SetSecurityAnalyzerRequest(BaseModel):
     "Payload to set security analyzer for a conversation"
 

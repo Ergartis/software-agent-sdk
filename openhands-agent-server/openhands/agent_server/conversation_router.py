@@ -34,6 +34,7 @@ from openhands.agent_server.models import (
     ConversationSortOrder,
     ForkConversationRequest,
     NavigateConversationRequest,
+    RejectPendingActionsRequest,
     SendMessageRequest,
     SetConfirmationPolicyRequest,
     SetSecurityAnalyzerRequest,
@@ -436,6 +437,38 @@ async def set_conversation_confirmation_policy(
     if event_service is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND)
     await event_service.set_confirmation_policy(request.policy)
+    return Success()
+
+
+@conversation_router.post(
+    "/{conversation_id}/reject_pending_actions",
+    responses={404: {"description": "Item not found"}},
+)
+async def reject_conversation_pending_actions(
+    conversation_id: UUID,
+    request: RejectPendingActionsRequest,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> Success:
+    """Reject the actions the agent is waiting for confirmation on.
+
+    A conversation-scoped alias for the deny half of confirmation mode.
+    `AlwaysConfirm` stops the agent at WAITING_FOR_CONFIRMATION, and `/run` is not a
+    way out: the run loop reads it as approval and EXECUTES the held action. Appending
+    a user message does not help either — it leaves the flag set, so the next `/run`
+    still runs what the person just refused.
+
+    The same effect is already reachable through
+    `POST /conversations/{id}/events/respond_to_confirmation` with `accept: false`;
+    both land on `EventService.reject_pending_actions`. This route exists so that a
+    deny is a URL of its own rather than a flag on an accept payload.
+
+    `reason` is handed to the agent as a `UserRejectObservation`, which makes a denial
+    a redirection ("not on main - use a branch") rather than a dead end.
+    """
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    await event_service.reject_pending_actions(request.reason)
     return Success()
 
 

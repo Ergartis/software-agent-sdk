@@ -3,6 +3,8 @@
 import os
 from collections.abc import Mapping
 
+from openhands.tools.terminal.constants import BLOCKING_NO_CHANGE_TIMEOUT_SECONDS
+
 
 RUNTIME_IDLE_TIMEOUT_SECONDS_ENV = "OH_RUNTIME_IDLE_TIMEOUT_SECONDS"
 MAX_FOREGROUND_TIMEOUT_RATIO = 0.9
@@ -93,3 +95,55 @@ def foreground_timeout_rejection_for(
         return None
 
     return foreground_timeout_rejection_message(timeout, idle_timeout)
+
+
+def should_break_blocked_command(
+    *,
+    is_blocking: bool,
+    time_since_last_change: float,
+    blocking_no_change_timeout_seconds: float = BLOCKING_NO_CHANGE_TIMEOUT_SECONDS,
+) -> bool:
+    """Whether a *blocking* command has been silent long enough to hand control back.
+
+    Passing an explicit ``timeout`` marks a command blocking, which switches off the
+    ordinary
+    30-second no-change check by design: an agent that asks for ``timeout=600`` on a
+    cold
+    compile is saying "do not pester me", and quiet phases in such commands are real.
+    That
+    exemption is right for a command that is quiet for a *while* and wrong for one that
+    is quiet
+    *forever* — a command blocked reading stdin in a sandbox with no interactive user
+    produces
+    new output never, so the hard timeout became the only remaining net, and an agent
+    that chose
+    a generous timeout had disabled every net it had.
+
+    Observed on task ``1f9a3848`` (2026-08-24): an agent-written Playwright script
+    ending in
+    ``input("Press Enter to close browser...")`` held a live run for 19 minutes and was
+    ended by
+    a person, not by this loop.
+
+    The rule keys on time since the last *change*, deliberately not on "produced no
+    output at
+    all": the motivating script printed a full page of results and only then blocked, so
+    a
+    "never produced anything" guard would miss the very case it exists for. What
+    separates
+    blocked from busy is not whether output ever appeared but how long ago the last byte
+    did.
+
+    Acting on this is safe because it **returns control rather than killing**: a
+    genuinely long
+    quiet phase costs one round-trip — the agent sends ``''`` and carries on waiting —
+    while a
+    real block gets broken.
+
+    Pure, so the rule is testable without a terminal, a clock, or a container.
+    """
+    if not is_blocking:
+        return False  # check 2 (the 30s rule) already owns non-blocking commands
+    if blocking_no_change_timeout_seconds <= 0:
+        return False  # disabled
+    return time_since_last_change >= blocking_no_change_timeout_seconds

@@ -8,6 +8,8 @@ from enum import Enum
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils import maybe_truncate
 from openhands.tools.terminal.constants import (
+    BLOCKED_NO_OUTPUT_MESSAGE_TEMPLATE,
+    BLOCKING_NO_CHANGE_TIMEOUT_SECONDS,
     CMD_OUTPUT_PS1_END,
     MAX_CMD_OUTPUT_SIZE,
     NO_CHANGE_TIMEOUT_SECONDS,
@@ -23,7 +25,10 @@ from openhands.tools.terminal.terminal.interface import (
     TerminalInterface,
     TerminalSessionBase,
 )
-from openhands.tools.terminal.timeout_policy import foreground_timeout_rejection_for
+from openhands.tools.terminal.timeout_policy import (
+    foreground_timeout_rejection_for,
+    should_break_blocked_command,
+)
 from openhands.tools.terminal.utils.command import (
     escape_bash_special_chars,
     needs_heredoc_completion_boundary,
@@ -351,8 +356,18 @@ class TerminalSession(TerminalSessionBase):
         terminal_content: str,
         ps1_matches: list[re.Match],
         echoed_command: str | None = None,
+        seconds: int | None = None,
+        message: str | None = None,
     ) -> TerminalObservation:
-        """Handle a command that timed out due to no output change."""
+        """Handle a command that timed out due to no output change.
+
+        Args:
+            seconds: how long it was quiet for. Defaults to the ordinary 30s rule.
+            message: what to tell the agent. Defaults to TIMEOUT_MESSAGE_TEMPLATE,
+                whose first suggestion is to wait longer — right for an ordinary
+                quiet patch, wrong for a command that has gone silent for good
+                (see BLOCKED_NO_OUTPUT_MESSAGE_TEMPLATE).
+        """
         self.prev_status = TerminalCommandStatus.NO_CHANGE_TIMEOUT
         if len(ps1_matches) != 1:
             logger.warning(
@@ -365,9 +380,10 @@ class TerminalSession(TerminalSessionBase):
             terminal_content, ps1_matches
         )
         metadata = CmdOutputMetadata()  # No metadata available
+        quiet_for = self.no_change_timeout_seconds if seconds is None else seconds
         metadata.suffix = (
             f"\n[The command has no new output after "
-            f"{self.no_change_timeout_seconds} seconds. {TIMEOUT_MESSAGE_TEMPLATE}]"
+            f"{quiet_for} seconds. {message or TIMEOUT_MESSAGE_TEMPLATE}]"
         )
         command_output = self._get_command_output(
             echoed_command or command,
@@ -741,6 +757,47 @@ class TerminalSession(TerminalSessionBase):
                     echoed_command=(
                         command_to_send if command_boundary_marker is not None else None
                     ),
+                )
+                return obs
+
+            # 2b) A *blocking* command that has produced nothing at all for far longer.
+            #
+            # Check 2 is skipped for blocking commands by design — an explicit timeout
+            # means "do not pester me", and a cold compile or a large install really
+            # does go quiet. But that only excuses being quiet for a WHILE. A command
+            # blocked reading stdin goes quiet FOREVER, and before this branch existed
+            # the hard timeout was the only thing that could end it: an agent that chose
+            # a generous timeout had disabled every net it had. Task 1f9a3848 sat for 19
+            # minutes on `input("Press Enter to close browser...")` and was ended by a
+            # human, not by us.
+            #
+            # The condition is time-since-last-CHANGE, deliberately not "produced no
+            # output at all". The motivating script printed a full page of test results
+            # and *then* blocked on input(), so a "never produced anything" guard would
+            # have missed the very case this exists for. What distinguishes blocked from
+            # busy is not whether output ever appeared, but how long ago the last byte
+            # did.
+            #
+            # This RETURNS CONTROL; it does not kill. A genuinely long quiet phase costs
+            # one round-trip — the agent sends '' and carries on waiting — while a real
+            # block gets broken. That asymmetry is why five minutes is safe to act on at
+            # all.
+            if should_break_blocked_command(
+                is_blocking=is_blocking,
+                time_since_last_change=time_since_last_change,
+            ):
+                # Same output handling as check 2 above (boundary wrapper stripped,
+                # echoed command restored); only the quiet period and message differ.
+                stripped_output = self._strip_boundary_wrapper(cur_terminal_output)
+                obs = self._handle_nochange_timeout_command(
+                    command,
+                    terminal_content=stripped_output,
+                    ps1_matches=CmdOutputMetadata.matches_ps1_metadata(stripped_output),
+                    echoed_command=(
+                        command_to_send if command_boundary_marker is not None else None
+                    ),
+                    seconds=BLOCKING_NO_CHANGE_TIMEOUT_SECONDS,
+                    message=BLOCKED_NO_OUTPUT_MESSAGE_TEMPLATE,
                 )
                 return obs
 

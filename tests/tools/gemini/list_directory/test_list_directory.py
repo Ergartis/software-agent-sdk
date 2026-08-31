@@ -39,6 +39,18 @@ def test_list_directory_basic(tmp_path):
     assert subdir_entry.is_directory
 
 
+def test_list_directory_accepts_the_common_path_argument(tmp_path):
+    """Models often call this field ``path``; accepting it avoids a tool error."""
+    (tmp_path / "file.txt").write_text("content")
+
+    action = ListDirectoryAction.model_validate({"path": str(tmp_path)})
+    obs = ListDirectoryExecutor(workspace_root=str(tmp_path))(action)
+
+    assert action.dir_path == str(tmp_path)
+    assert not obs.is_error
+    assert [entry.name for entry in obs.entries] == ["file.txt"]
+
+
 def test_list_directory_empty(tmp_path):
     """Test listing empty directory."""
     empty_dir = tmp_path / "empty"

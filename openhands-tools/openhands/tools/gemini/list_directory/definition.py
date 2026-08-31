@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from rich.text import Text
 
 from openhands.sdk.tool import (
@@ -36,6 +36,7 @@ class ListDirectoryAction(Action):
 
     dir_path: str = Field(
         default=".",
+        validation_alias=AliasChoices("dir_path", "path"),
         description="The path to the directory to list. Defaults to current directory.",
     )
     recursive: bool = Field(

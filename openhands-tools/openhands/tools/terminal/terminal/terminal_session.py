@@ -668,7 +668,6 @@ class TerminalSession(TerminalSessionBase):
                     seconds=BLOCKING_NO_CHANGE_TIMEOUT_SECONDS,
                     message=BLOCKED_NO_OUTPUT_MESSAGE_TEMPLATE,
                 )
-                logger.debug(f"RETURNING OBSERVATION (blocked-no-output): {obs}")
                 return obs
 
             # 3) Execution timed out since the command has been running for too long

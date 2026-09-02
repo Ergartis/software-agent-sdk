@@ -5232,7 +5232,7 @@ class TestMaybeSetSessionModel:
         # session/new advertised (detected upstream), not a hardcoded guess.
         conn_cfg = AsyncMock()
         applied = await _maybe_set_session_model(
-            conn_cfg, "devin-cli", "session-1", "kimi-k2-6", via_config_option=True
+            conn_cfg, "competitor-x-cli", "session-1", "kimi-k2-6", via_config_option=True
         )
         conn_cfg.set_config_option.assert_awaited_once_with(
             config_id="model", value="kimi-k2-6", session_id="session-1"
@@ -5242,7 +5242,7 @@ class TestMaybeSetSessionModel:
 
         conn_set = AsyncMock()
         applied = await _maybe_set_session_model(
-            conn_set, "devin-cli", "session-1", "kimi-k2-6", via_config_option=False
+            conn_set, "competitor-x-cli", "session-1", "kimi-k2-6", via_config_option=False
         )
         conn_set.set_session_model.assert_awaited_once_with(
             model_id="kimi-k2-6", session_id="session-1"
@@ -5356,7 +5356,7 @@ class TestReapplySessionModelOnResume:
         # resumed session advertised, not a hardcoded guess.
         conn = AsyncMock()
         applied = await _reapply_session_model_on_resume(
-            conn, "devin-cli", "sess-1", "kimi-k2-6", via_config_option=True
+            conn, "competitor-x-cli", "sess-1", "kimi-k2-6", via_config_option=True
         )
         conn.set_session_model.assert_not_called()
         conn.set_config_option.assert_awaited_once_with(

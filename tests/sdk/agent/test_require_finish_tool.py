@@ -179,3 +179,66 @@ def test_the_flag_survives_serialization(flag: bool):
     restored = Agent.model_validate(agent.model_dump())
 
     assert restored.require_finish_tool is flag
+
+
+class _RecordingProseLLM(_ProseLLM):
+    """Prose every step, and remembers what each call was sent."""
+
+    _calls: list = PrivateAttr(default_factory=list)
+
+    def completion(self, *, messages, tools=None, **kwargs) -> LLMResponse:  # type: ignore[override]
+        self._calls.append(list(messages))
+        return _prose(self._text)
+
+
+def test_the_call_after_prose_never_ends_with_the_agents_own_message():
+    """Claude rejects a conversation that ends with an assistant turn ("This model does
+    not support assistant message prefill"), and require_finish_tool is exactly what
+    produces one: prose no longer finishes the run, so the next step is sent the log as
+    it stands — ending in the agent's own words. GLM through OpenRouter accepted that;
+    Claude Sonnet 5 failed live run a7666d29 (2026-09-28) on the step after the agent
+    asked its supervisor a question.
+    """
+    llm = _RecordingProseLLM()
+    agent = Agent(
+        llm=llm,
+        tools=[],
+        require_finish_tool=True,
+        include_default_tools=["FinishTool"],
+    )
+    conversation = Conversation(agent=agent)
+    assert isinstance(conversation, LocalConversation)
+    conversation._ensure_agent_ready()
+    conversation.send_message("Add a healthcheck endpoint")
+    events: list[Event] = []
+
+    _step(conversation, events)  # the agent answers in prose and keeps running
+    _step(conversation, events)  # the next call must not end with that prose
+
+    second = llm._calls[1]
+    assert second[-1].role == "user"
+    assert "finish" in str(second[-1].content).lower()
+
+
+def test_the_continue_turn_is_not_written_to_the_log():
+    """Ephemeral, like REPLY_DIRECTIVE: written to the log it would read as a human
+    turn and reset the chatter guard, so a model talking to itself would never stop."""
+    llm = _RecordingProseLLM()
+    agent = Agent(
+        llm=llm,
+        tools=[],
+        require_finish_tool=True,
+        include_default_tools=["FinishTool"],
+        max_consecutive_prose_steps=2,
+    )
+    conversation = Conversation(agent=agent)
+    assert isinstance(conversation, LocalConversation)
+    conversation._ensure_agent_ready()
+    conversation.send_message("Add a healthcheck endpoint")
+    events: list[Event] = []
+
+    _step(conversation, events)
+    _step(conversation, events)
+
+    assert all(e.source == "agent" for e in events if isinstance(e, MessageEvent))
+    assert conversation.state.execution_status == S.FINISHED  # the guard still fires

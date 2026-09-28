@@ -15,10 +15,12 @@ from openhands.sdk.agent.base import AgentBase
 from openhands.sdk.agent.critic_mixin import CriticMixin
 from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
 from openhands.sdk.agent.response_dispatch import (
+    CONTINUE_DIRECTIVE,
     REPLY_DIRECTIVE,
     LLMResponseType,
     ResponseDispatchMixin,
     classify_response,
+    ends_with_agent_message,
     reply_is_owed,
 )
 from openhands.sdk.agent.stream_context import StreamContext
@@ -801,6 +803,12 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             _messages = _messages + [
                 Message(role="user", content=[TextContent(text=REPLY_DIRECTIVE)])
             ]
+        elif ends_with_agent_message(_messages):
+            # Ephemeral too. See CONTINUE_DIRECTIVE: a model that rejects assistant
+            # prefill fails the whole call otherwise.
+            _messages = _messages + [
+                Message(role="user", content=[TextContent(text=CONTINUE_DIRECTIVE)])
+            ]
 
         try:
             llm_response = self.llm.generate(
@@ -1016,6 +1024,11 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
             logger.info("A human is waiting on an answer; taking one tool-free step.")
             _messages = _messages + [
                 Message(role="user", content=[TextContent(text=REPLY_DIRECTIVE)])
+            ]
+        elif ends_with_agent_message(_messages):
+            # See the sync path in step().
+            _messages = _messages + [
+                Message(role="user", content=[TextContent(text=CONTINUE_DIRECTIVE)])
             ]
 
         try:

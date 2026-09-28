@@ -132,6 +132,30 @@ REPLY_DIRECTIVE = (
 )
 
 
+# Appended, like REPLY_DIRECTIVE, only to the message list of a call whose history ends
+# with the agent's OWN message — never written to the event log.
+#
+# require_finish_tool is what produces that history: prose no longer finishes the
+# run, so the next step is sent the log as it stands, ending in the agent's words.
+# Some models accept that as a continuation; Claude (the 4.6 family onwards) rejects
+# the whole call - "This model does not support assistant message prefill. The
+# conversation must end with a user message." - so a Claude run died on the step
+# after the agent first spoke (live run a7666d29, 2026-09-28). Kept out of the log
+# for the reason REPLY_DIRECTIVE is: logged, it would read as a human turn and reset
+# the chatter guard.
+CONTINUE_DIRECTIVE = (
+    "Your message above has been shown to the person supervising this run. Carry on "
+    "with the task using your tools. When the task is complete, call the finish tool "
+    "with a summary. If you cannot go on without the person's answer, call the finish "
+    "tool and say exactly what you need from them."
+)
+
+
+def ends_with_agent_message(messages: list[Message]) -> bool:
+    """Whether a call would be sent a history whose last turn is the assistant's own."""
+    return bool(messages) and messages[-1].role == "assistant"
+
+
 def reply_is_owed(state: ConversationState) -> bool:
     """Whether a person is waiting on an answer the agent has not given yet.
 

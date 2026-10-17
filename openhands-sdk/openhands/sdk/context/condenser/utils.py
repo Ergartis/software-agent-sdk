@@ -1,8 +1,73 @@
 from collections.abc import Sequence
 
 from openhands.sdk.event.base import LLMConvertibleEvent
+from openhands.sdk.event.condenser import CondensationSummaryEvent
+from openhands.sdk.event.llm_convertible import (
+    ActionEvent,
+    AgentErrorEvent,
+    MessageEvent,
+    ObservationEvent,
+    UserRejectObservation,
+)
 from openhands.sdk.event.llm_convertible.system import SystemPromptEvent
-from openhands.sdk.llm import LLM
+from openhands.sdk.llm import LLM, content_to_str
+from openhands.sdk.utils import maybe_truncate
+
+
+def render_event_for_summary(
+    event: LLMConvertibleEvent, max_length: int | None = None
+) -> str:
+    """Render one forgotten event as the summarizing LLM should see it.
+
+    Not ``str(event)``: that is a display preview capped at ``N_CHAR_PREVIEW``
+    (500) characters, and it renders an action as its class name alone. Fed to
+    the summarizer it cut every previous summary to its first ~500 characters
+    and hid which command ran, which file was read and what a long user message
+    ended with -- so each condensation forgot the work the last one recorded,
+    and the agent repeated it.
+
+    This shows what the agent itself was shown: a previous summary whole, an
+    action as its tool and arguments, a result, error or user message as its
+    text. ``max_length`` caps the rendered event, keeping head and tail; event
+    types not listed here keep their ``str()`` form.
+    """
+    if isinstance(event, CondensationSummaryEvent):
+        text = f"PREVIOUS SUMMARY ({event.source})\n{event.summary}"
+    elif isinstance(event, ActionEvent):
+        lines = [f"ActionEvent ({event.source})", f"  Tool: {event.tool_name}"]
+        if event.summary:
+            lines.append(f"  Summary: {event.summary}")
+        thought = " ".join(t.text for t in event.thought).strip()
+        if thought:
+            lines.append(f"  Thought: {thought}")
+        lines.append(f"  Arguments: {event.tool_call.arguments}")
+        if event.action is None:
+            lines.append("  (not executed)")
+        text = "\n".join(lines)
+    elif isinstance(event, ObservationEvent):
+        result = "".join(content_to_str(event.observation.to_llm_content))
+        text = (
+            f"ObservationEvent ({event.source})\n"
+            f"  Tool: {event.tool_name}\n  Result: {result}"
+        )
+    elif isinstance(event, UserRejectObservation):
+        text = (
+            f"UserRejectObservation ({event.source})\n  Tool: {event.tool_name}\n"
+            f"  Rejected by {event.rejection_source}: {event.rejection_reason}"
+        )
+    elif isinstance(event, AgentErrorEvent):
+        text = (
+            f"AgentErrorEvent ({event.source})\n  Tool: {event.tool_name}\n"
+            f"  Error: {event.error}"
+        )
+    elif isinstance(event, MessageEvent):
+        body = " ".join(content_to_str(event.llm_message.content)) or "[no text]"
+        text = f"MessageEvent ({event.source})\n  {event.llm_message.role}: {body}"
+        if event.activated_skills:
+            text += f"\n  [Skills: {', '.join(event.activated_skills)}]"
+    else:
+        text = str(event)
+    return maybe_truncate(text, truncate_after=max_length)
 
 
 def get_total_token_count(

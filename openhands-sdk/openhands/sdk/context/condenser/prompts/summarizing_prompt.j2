@@ -1,5 +1,7 @@
 You are maintaining a context-aware state summary for an interactive agent.
 You will be given a list of events corresponding to actions taken by the agent, which will include previous summaries.
+A PREVIOUS SUMMARY is the agent's only memory of the work before it. Carry every fact in it forward (files read and what they contain, commands run and their results, decisions, changes) unless a later event changes it, and never report as not done or not checked what it or an event shows was done.
+Keep every request, answer and correction the user gave; quote short answers (ids, names, values) verbatim.
 If the events being summarized contain ANY task-tracking, you MUST include a TASK_TRACKING section to maintain continuity.
 When referencing tasks make sure to preserve exact task IDs and statuses.
 

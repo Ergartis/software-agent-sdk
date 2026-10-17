@@ -1,3 +1,5 @@
+import json
+from collections.abc import Sequence
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,14 +23,21 @@ from openhands.sdk.context.condenser.llm_summarizing_condenser import (
 from openhands.sdk.context.view import View
 from openhands.sdk.event.base import Event
 from openhands.sdk.event.condenser import Condensation, CondensationRequest
-from openhands.sdk.event.llm_convertible import MessageEvent
+from openhands.sdk.event.llm_convertible import (
+    ActionEvent,
+    MessageEvent,
+    ObservationEvent,
+)
 from openhands.sdk.llm import (
     LLM,
+    ImageContent,
     LLMResponse,
     Message,
+    MessageToolCall,
     MetricsSnapshot,
     TextContent,
 )
+from openhands.sdk.tool import Action, Observation
 
 
 def message_event(content: str) -> MessageEvent:
@@ -1069,3 +1078,309 @@ def test_summarization_uses_llm_as_is_when_not_streaming(mock_transport) -> None
     assert result.summary == "A summary"
     # The exact same LLM instance is used (no copy when not streaming).
     assert mock_transport.call_args.args[0] is llm
+
+
+# ---------------------------------------------------------------------------
+# What the summarizer is shown
+#
+# The summary is the agent's ONLY memory of every forgotten event, so what the
+# summarizer is shown bounds what the agent can remember. These tests pin that
+# input to the events themselves rather than to `str(event)`, which is a
+# 500-character display preview: it cut a previous summary to its first ~500
+# characters (in practice, USER_CONTEXT alone) and rendered every action as its
+# class name with no command, path or arguments.
+# ---------------------------------------------------------------------------
+
+
+class SummaryInputMockAction(Action):
+    command: str
+
+
+class SummaryInputMockObservation(Observation):
+    result: str
+
+    @property
+    def to_llm_content(self) -> Sequence[TextContent | ImageContent]:
+        return [TextContent(text=self.result)]
+
+
+def _tool_pair(
+    call_id: str,
+    arguments: dict[str, Any],
+    result: str,
+    *,
+    thought: str = "",
+    summary: str | None = None,
+    tool_name: str = "terminal",
+) -> list[Event]:
+    """An action and its observation, as the agent loop records them."""
+    action = ActionEvent(
+        thought=[TextContent(text=thought)] if thought else [],
+        action=SummaryInputMockAction(command=str(arguments.get("command", ""))),
+        tool_name=tool_name,
+        tool_call_id=call_id,
+        tool_call=MessageToolCall(
+            id=call_id,
+            name=tool_name,
+            arguments=json.dumps(arguments),
+            origin="completion",
+        ),
+        llm_response_id=f"response-{call_id}",
+        summary=summary,
+    )
+    observation = ObservationEvent(
+        observation=SummaryInputMockObservation(result=result),
+        action_id=action.id,
+        tool_name=tool_name,
+        tool_call_id=call_id,
+    )
+    return [action, observation]
+
+
+def _summarizer_prompt(mock_llm: LLM) -> str:
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.assert_called_once()
+    messages = completion_mock.call_args[1]["messages"]
+    return "\n".join(
+        part.text
+        for message in messages
+        for part in message.content
+        if isinstance(part, TextContent)
+    )
+
+
+def _view_forgetting(
+    forgettable: Sequence[Event], previous_summary: str | None
+) -> View:
+    """A view whose next condensation forgets every event in `forgettable`.
+
+    keep_first=2 and max_size=10 keep two events at the head and two at the
+    tail; the previous summary, when given, sits at the head of the forgotten
+    range exactly where a real earlier condensation put it.
+    """
+    head: list[Event] = [message_event("The task"), message_event("Head event")]
+    tail: list[Event] = [message_event(f"Tail {i}") for i in range(6)]
+    events: list[Event] = list(head)
+    if previous_summary is not None:
+        stale = message_event("Already summarised")
+        events.append(stale)
+        events.append(
+            Condensation(
+                forgotten_event_ids={stale.id},
+                summary=previous_summary,
+                summary_offset=2,
+                llm_response_id="earlier-condensation",
+            )
+        )
+    return View.from_events([*events, *forgettable, *tail])
+
+
+def test_summarizer_sees_the_whole_previous_summary(mock_llm: LLM) -> None:
+    """Every condensation after the first re-summarises the previous summary.
+
+    Cut to a preview, its COMPLETED / CODE_STATE / VERSION_CONTROL_STATUS
+    sections vanish and the next summary reports work already done as "not
+    checked yet" -- the agent then explores the same files again.
+    """
+    previous = (
+        "USER_CONTEXT:\n- Add workstations as first-class entities.\n"
+        + "COMPLETED:\n"
+        + "".join(f"- Reviewed models/Model{i}.js and its routes\n" for i in range(60))
+        + "VERSION_CONTROL_STATUS:\n- Backend HEAD is d006196 on master\n"
+    )
+    assert len(previous) > 2000
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+
+    condenser.get_condensation(
+        _view_forgetting([message_event(f"Middle {i}") for i in range(4)], previous)
+    )
+
+    prompt = _summarizer_prompt(mock_llm)
+    assert "Backend HEAD is d006196 on master" in prompt
+    assert "Reviewed models/Model59.js" in prompt
+
+
+def test_summarizer_sees_what_each_action_did(mock_llm: LLM) -> None:
+    """An action is its tool and arguments, not its class name.
+
+    Most models emit tool calls with no thought text, so a preview of an action
+    was literally `Thought:` and `Action: SummaryInputMockAction` -- the
+    summarizer could not tell which command ran or which file was read.
+    """
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    forgettable = _tool_pair(
+        "call-1",
+        {"command": "cat balapitiya_automobiles_backend/package.json"},
+        '{"name": "balapitiya_automobiles_backend"}',
+        summary="Read backend package.json",
+    ) + [message_event("Middle")]
+
+    condenser.get_condensation(_view_forgetting(forgettable, None))
+
+    prompt = _summarizer_prompt(mock_llm)
+    assert "cat balapitiya_automobiles_backend/package.json" in prompt
+    assert "Read backend package.json" in prompt
+    assert "terminal" in prompt
+
+
+def test_summarizer_sees_a_long_user_message_whole(mock_llm: LLM) -> None:
+    """A user's answer at the end of a long message must reach the summary."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    answer = "Ticket id is AB-TEST-12"
+    long_message = "Some context about the change. " * 40 + answer
+    assert len(long_message) > 1000
+
+    condenser.get_condensation(
+        _view_forgetting(
+            [message_event(long_message)]
+            + [message_event(f"Middle {i}") for i in range(3)],
+            None,
+        )
+    )
+
+    assert answer in _summarizer_prompt(mock_llm)
+
+
+def test_summarizer_sees_the_tail_of_a_tool_result(mock_llm: LLM) -> None:
+    """The verdict of a command is usually its last line, past any preview."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    output = "> webpack compiling\n" * 150 + "npm ERR! Missing script: start"
+    assert len(output) > 2000
+
+    condenser.get_condensation(
+        _view_forgetting(
+            _tool_pair("call-1", {"command": "npm start"}, output)
+            + [message_event("Middle")],
+            None,
+        )
+    )
+
+    assert "npm ERR! Missing script: start" in _summarizer_prompt(mock_llm)
+
+
+def test_summarizer_input_stays_bounded_for_a_huge_tool_result(mock_llm: LLM) -> None:
+    """Whole events, but never an unbounded one: the head and tail survive."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    output = "FIRST LINE\n" + "x" * 200_000 + "\nLAST LINE"
+
+    condenser.get_condensation(
+        _view_forgetting(
+            _tool_pair("call-1", {"command": "cat big.log"}, output)
+            + [message_event("Middle")],
+            None,
+        )
+    )
+
+    prompt = _summarizer_prompt(mock_llm)
+    assert "FIRST LINE" in prompt
+    assert "LAST LINE" in prompt
+    assert len(prompt) < 20_000
+
+
+@pytest.mark.asyncio
+async def test_async_summarizer_sees_the_whole_previous_summary(
+    mock_llm: LLM,
+) -> None:
+    """The async path renders events the same way as the sync one."""
+    previous = (
+        "USER_CONTEXT:\n- Goal\n" + "x" * 3000 + "\nPENDING:\n- Write the model\n"
+    )
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    forgettable = _tool_pair("call-1", {"command": "ls -la routes"}, "app.js")
+    forgettable.append(message_event("Middle"))
+
+    await condenser.aget_condensation(_view_forgetting(forgettable, previous))
+
+    acompletion_mock = cast(AsyncMock, mock_llm.acompletion)
+    acompletion_mock.assert_awaited_once()
+    prompt = "\n".join(
+        part.text
+        for message in acompletion_mock.call_args[1]["messages"]
+        for part in message.content
+        if isinstance(part, TextContent)
+    )
+    assert "- Write the model" in prompt
+    assert "ls -la routes" in prompt
+
+
+def test_hard_context_reset_retry_shrinks_from_the_rendered_events(
+    mock_llm: LLM,
+) -> None:
+    """A failed reset retries at 80% of the longest event, not of its preview.
+
+    Scaling from the ~500-character preview cut every event to ~400 characters
+    on the first retry, however small the overflow was.
+    """
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    fact = "the payment service listens on port 8443"
+    long_message = "Background. " * 150 + fact + "."
+    view = View.from_events(
+        [message_event("The task"), message_event(long_message), message_event("x")]
+    )
+    ok = cast(MagicMock, mock_llm.completion).return_value
+    cast(MagicMock, mock_llm.completion).side_effect = [
+        RuntimeError("context window exceeded"),
+        ok,
+    ]
+
+    assert condenser.hard_context_reset(view) is not None
+
+    retry_messages = cast(MagicMock, mock_llm.completion).call_args[1]["messages"]
+    retry_prompt = "\n".join(
+        part.text
+        for message in retry_messages
+        for part in message.content
+        if isinstance(part, TextContent)
+    )
+    assert fact in retry_prompt
+
+
+def test_summarizer_overflow_shrinks_events_instead_of_failing(mock_llm: LLM) -> None:
+    """Whole events may not fit a smaller summarizer window: shrink, then retry.
+
+    Failing instead would fall through to a hard context reset, which forgets
+    every event -- far worse than a summary of trimmed ones.
+    """
+    from openhands.sdk.llm.exceptions import LLMContextWindowExceedError
+
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    ok = cast(MagicMock, mock_llm.completion).return_value
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.side_effect = [LLMContextWindowExceedError("too long"), ok]
+    output = "START\n" + "y" * 8_000 + "\nEND"
+
+    result = condenser.get_condensation(
+        _view_forgetting(
+            _tool_pair("call-1", {"command": "cat big"}, output)
+            + [message_event("Middle")],
+            None,
+        )
+    )
+
+    assert isinstance(result, Condensation)
+    assert completion_mock.call_count == 2
+    first, retry = (
+        "\n".join(
+            part.text
+            for message in call[1]["messages"]
+            for part in message.content
+            if isinstance(part, TextContent)
+        )
+        for call in completion_mock.call_args_list
+    )
+    assert len(retry) < len(first)
+    assert "START" in retry and "END" in retry
+
+
+def test_summarizer_failure_that_is_not_overflow_is_not_retried(mock_llm: LLM) -> None:
+    """An auth or provider error will not go away by trimming: raise at once."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.side_effect = RuntimeError("401 unauthorized")
+
+    with pytest.raises(NoCondensationAvailableException):
+        condenser.get_condensation(
+            _view_forgetting([message_event(f"Middle {i}") for i in range(4)], None)
+        )
+
+    assert completion_mock.call_count == 1

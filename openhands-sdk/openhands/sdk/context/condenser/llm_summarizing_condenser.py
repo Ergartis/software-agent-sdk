@@ -221,12 +221,29 @@ class LLMSummarizingCondenser(RollingCondenser):
         events: Sequence[LLMConvertibleEvent],
         max_event_str_length: int | None,
     ) -> int:
-        """The next, smaller per-event cap after the summarizer call failed."""
-        if max_event_str_length is None:
-            max_event_str_length = max(
-                len(text) for text in self._render_forgotten_events(events)
-            )
-        return int(max_event_str_length * self.hard_context_reset_context_scaling)
+        """The next per-event cap after the summarizer call failed.
+
+        Chosen so the rendered total -- not just the longest event -- falls to
+        ``hard_context_reset_context_scaling`` of what was just sent: scaling the
+        longest event alone leaves every shorter one untouched, so a prompt made
+        of many mid-sized events is re-sent almost unchanged. Returns 0 when no
+        positive cap gets there, i.e. there is nothing left to cut.
+        """
+        lengths = [
+            len(text)
+            for text in self._render_forgotten_events(events, max_event_str_length)
+        ]
+        target = sum(lengths) * self.hard_context_reset_context_scaling
+        # The largest cap whose capped total fits the target (capping never grows
+        # an event, so the total is monotonic in the cap).
+        low, high = 0, max(lengths)
+        while low < high:
+            cap = (low + high + 1) // 2
+            if sum(min(length, cap) for length in lengths) <= target:
+                low = cap
+            else:
+                high = cap - 1
+        return low
 
     def _summarize(
         self, forgotten_events: Sequence[LLMConvertibleEvent], summary_offset: int
@@ -255,6 +272,10 @@ class LLMSummarizingCondenser(RollingCondenser):
                 max_event_str_length = self._shrunk_event_length(
                     forgotten_events, max_event_str_length
                 )
+                if max_event_str_length <= 0:
+                    raise NoCondensationAvailableException(
+                        "Summarizer context exceeded with nothing left to cut."
+                    ) from e
                 logger.warning(
                     "Summarizer context exceeded; retrying with each event cut to "
                     f"{max_event_str_length} characters."
@@ -284,6 +305,10 @@ class LLMSummarizingCondenser(RollingCondenser):
                 max_event_str_length = self._shrunk_event_length(
                     forgotten_events, max_event_str_length
                 )
+                if max_event_str_length <= 0:
+                    raise NoCondensationAvailableException(
+                        "Summarizer context exceeded with nothing left to cut."
+                    ) from e
                 logger.warning(
                     "Summarizer context exceeded; retrying with each event cut to "
                     f"{max_event_str_length} characters."
@@ -448,8 +473,8 @@ class LLMSummarizingCondenser(RollingCondenser):
             except Exception as e:
                 # Since the summarization failed, cut every event to 80% of the
                 # longest one as rendered -- not of its 500-character preview.
-                max_event_str_length = self._shrunk_event_length(
-                    view.events, max_event_str_length
+                max_event_str_length = max(
+                    1, self._shrunk_event_length(view.events, max_event_str_length)
                 )
 
                 # Log the exception so we can track these failures
@@ -589,8 +614,8 @@ class LLMSummarizingCondenser(RollingCondenser):
                     max_event_str_length=max_event_str_length,
                 )
             except Exception as e:
-                max_event_str_length = self._shrunk_event_length(
-                    view.events, max_event_str_length
+                max_event_str_length = max(
+                    1, self._shrunk_event_length(view.events, max_event_str_length)
                 )
                 logger.warning(
                     f"Hard context reset summarization failed: {e}. "

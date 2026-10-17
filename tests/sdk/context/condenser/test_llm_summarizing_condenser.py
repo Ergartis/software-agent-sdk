@@ -1384,3 +1384,134 @@ def test_summarizer_failure_that_is_not_overflow_is_not_retried(mock_llm: LLM) -
         )
 
     assert completion_mock.call_count == 1
+
+
+def _overflow_above(limit: int, ok: LLMResponse):
+    """A summarizer whose window holds `limit` characters of prompt."""
+    from openhands.sdk.llm.exceptions import LLMContextWindowExceedError
+
+    def complete(*_args: Any, **kwargs: Any) -> LLMResponse:
+        size = sum(
+            len(part.text)
+            for message in kwargs["messages"]
+            for part in message.content
+            if isinstance(part, TextContent)
+        )
+        if size > limit:
+            raise LLMContextWindowExceedError(f"{size} > {limit}")
+        return ok
+
+    return complete
+
+
+def _many_short_events_and_one_long() -> list[Event]:
+    """The shape a per-event cap alone cannot shrink: most events sit below it."""
+    events: list[Event] = _tool_pair("call-big", {"command": "cat big"}, "z" * 9_000)
+    for i in range(40):
+        events += _tool_pair(f"call-{i}", {"command": f"cat f{i}"}, "w" * 1_200)
+    return events
+
+
+def test_summarizer_overflow_shrinks_the_whole_prompt_not_one_event(
+    mock_llm: LLM,
+) -> None:
+    """Each retry must cut the prompt, not only the longest event.
+
+    Lowering the cap from the longest event leaves forty 1,200-character results
+    untouched, so every retry re-sends nearly the same prompt and the condenser
+    falls through to the hard reset the retry exists to avoid.
+    """
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    view = _view_forgetting(_many_short_events_and_one_long(), None)
+    full = len("".join(condenser._render_forgotten_events(view.events)))
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.side_effect = _overflow_above(
+        int(full * 0.6), completion_mock.return_value
+    )
+
+    result = condenser.get_condensation(view)
+
+    assert isinstance(result, Condensation)
+    assert completion_mock.call_count <= condenser.hard_context_reset_max_retries
+
+
+def test_summarizer_overflow_gives_up_when_nothing_is_left_to_cut(
+    mock_llm: LLM,
+) -> None:
+    """A window that cannot hold even the trimmed events raises, never loops."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.side_effect = _overflow_above(10, completion_mock.return_value)
+
+    with pytest.raises(NoCondensationAvailableException):
+        condenser.get_condensation(
+            _view_forgetting(_many_short_events_and_one_long(), None)
+        )
+
+    sizes = [
+        sum(
+            len(part.text)
+            for message in call[1]["messages"]
+            for part in message.content
+            if isinstance(part, TextContent)
+        )
+        for call in completion_mock.call_args_list
+    ]
+    assert len(sizes) <= condenser.hard_context_reset_max_retries
+    assert sizes == sorted(sizes, reverse=True)
+    assert len(set(sizes)) == len(sizes), "a retry re-sent the same prompt"
+
+
+@pytest.mark.asyncio
+async def test_async_summarizer_overflow_shrinks_events_instead_of_failing(
+    mock_llm: LLM,
+) -> None:
+    """Async variant of the overflow retry: shrink, then succeed."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    view = _view_forgetting(_many_short_events_and_one_long(), None)
+    full = len("".join(condenser._render_forgotten_events(view.events)))
+    sync_ok = cast(MagicMock, mock_llm.completion).return_value
+    acompletion_mock = AsyncMock(side_effect=_overflow_above(int(full * 0.6), sync_ok))
+    cast(Any, mock_llm).acompletion = acompletion_mock
+
+    result = await condenser.aget_condensation(view)
+
+    assert isinstance(result, Condensation)
+    assert 1 < acompletion_mock.await_count <= condenser.hard_context_reset_max_retries
+
+
+@pytest.mark.asyncio
+async def test_async_summarizer_failure_that_is_not_overflow_is_not_retried(
+    mock_llm: LLM,
+) -> None:
+    """Async variant: an auth or provider error raises at once."""
+    condenser = LLMSummarizingCondenser(llm=mock_llm, max_size=10, keep_first=2)
+    acompletion_mock = AsyncMock(side_effect=RuntimeError("401 unauthorized"))
+    cast(Any, mock_llm).acompletion = acompletion_mock
+
+    with pytest.raises(NoCondensationAvailableException):
+        await condenser.aget_condensation(
+            _view_forgetting([message_event(f"Middle {i}") for i in range(4)], None)
+        )
+
+    assert acompletion_mock.await_count == 1
+
+
+def test_summarizer_overflow_never_resends_untrimmed_events(mock_llm: LLM) -> None:
+    """A cap that rounds to 0 means "no truncation" downstream: raise instead.
+
+    `maybe_truncate(text, 0)` returns the text whole, so retrying at a 0 cap would
+    re-send the full prompt that just overflowed.
+    """
+    condenser = LLMSummarizingCondenser(
+        llm=mock_llm, max_size=10, keep_first=2, hard_context_reset_context_scaling=0.01
+    )
+    completion_mock = cast(MagicMock, mock_llm.completion)
+    completion_mock.side_effect = _overflow_above(10, completion_mock.return_value)
+
+    with pytest.raises(NoCondensationAvailableException, match="nothing left to cut"):
+        condenser.get_condensation(
+            _view_forgetting([message_event(f"Middle {i}") for i in range(4)], None)
+        )
+
+    assert completion_mock.call_count == 1

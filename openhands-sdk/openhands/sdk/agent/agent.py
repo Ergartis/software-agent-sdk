@@ -226,6 +226,21 @@ def _should_handle_non_multimodal_image_input(
     return _latest_user_message_contains_image(messages) and not llm.vision_is_active()
 
 
+def _mask_condensation(
+    condensation: Condensation, conversation: LocalConversation
+) -> Condensation:
+    """Mask registered secrets in a condensation's summary before it is emitted.
+
+    The summary is durable model output, replayed to the agent on every later
+    step, and the summarizer sees each forgotten action's arguments verbatim --
+    a token typed into a git URL included. Masked like any agent message (#4783).
+    """
+    if not condensation.summary:
+        return condensation
+    mask = conversation.state.secret_registry.mask_secrets_in_output
+    return condensation.model_copy(update={"summary": mask(condensation.summary)})
+
+
 @dataclass(frozen=True, slots=True)
 class _ActionBatch:
     """Immutable result of preparing a batch of actions for execution.
@@ -757,7 +772,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
 
         # Process condensation event before agent sampels another action
         if isinstance(_messages_or_condensation, Condensation):
-            on_event(_messages_or_condensation)
+            on_event(_mask_condensation(_messages_or_condensation, conversation))
             return
 
         _messages = _messages_or_condensation
@@ -985,7 +1000,7 @@ class Agent(CriticMixin, ResponseDispatchMixin, AgentBase):
         )
 
         if isinstance(_messages_or_condensation, Condensation):
-            on_event(_messages_or_condensation)
+            on_event(_mask_condensation(_messages_or_condensation, conversation))
             return
 
         _messages = _messages_or_condensation

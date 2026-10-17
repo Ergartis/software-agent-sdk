@@ -1,7 +1,7 @@
 import os
 from collections.abc import Sequence
 from enum import Enum
-from typing import Final
+from typing import ClassVar, Final
 
 from pydantic import Field, model_validator
 
@@ -13,16 +13,17 @@ from openhands.sdk.context.condenser.base import (
 from openhands.sdk.context.condenser.utils import (
     get_suffix_length_for_token_reduction,
     get_total_token_count,
+    render_event_for_summary,
 )
 from openhands.sdk.context.prompts import render_template
 from openhands.sdk.context.view import View
 from openhands.sdk.event.base import LLMConvertibleEvent
-from openhands.sdk.event.condenser import Condensation
+from openhands.sdk.event.condenser import Condensation, CondensationSummaryEvent
 from openhands.sdk.event.llm_convertible import SystemPromptEvent
 from openhands.sdk.llm import LLM, Message, TextContent
+from openhands.sdk.llm.exceptions.classifier import is_context_window_exceeded
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability.laminar import observe
-from openhands.sdk.utils import maybe_truncate
 
 
 logger = get_logger(__name__)
@@ -76,6 +77,13 @@ class LLMSummarizingCondenser(RollingCondenser):
     """
     """Minimum ratio of the view to be condensed. Condensations below this threshold
     are treated as errors.
+    """
+
+    max_event_length: ClassVar[int] = 10_000
+    """Longest a single forgotten event may be when shown to the summarizer, in
+    characters; longer ones keep their head and tail. A previous summary is exempt:
+    it is the agent's only record of everything condensed before it. A class
+    constant, not a field, so the condenser's settings schema is unchanged.
     """
 
     hard_context_reset_max_retries: int = Field(default=5, gt=0)
@@ -221,6 +229,129 @@ class LLMSummarizingCondenser(RollingCondenser):
             Message(role="user", content=[TextContent(text=events_prompt)]),
         ]
 
+    def _render_forgotten_events(
+        self,
+        forgotten_events: Sequence[LLMConvertibleEvent],
+        max_event_str_length: int | None = None,
+    ) -> list[str]:
+        """Render forgotten events for the summarizer, whole up to the length caps.
+
+        Every event is capped at ``max_event_length``, except a previous summary.
+        ``max_event_str_length`` -- set only when the summarizer overflowed and the
+        input is being shrunk -- caps every event, the previous summary included.
+        """
+        rendered = []
+        for event in forgotten_events:
+            limits = [max_event_str_length]
+            if not isinstance(event, CondensationSummaryEvent):
+                limits.append(self.max_event_length)
+            caps = [limit for limit in limits if limit is not None]
+            rendered.append(
+                render_event_for_summary(event, min(caps) if caps else None)
+            )
+        return rendered
+
+    def _shrunk_event_length(
+        self,
+        events: Sequence[LLMConvertibleEvent],
+        max_event_str_length: int | None,
+    ) -> int:
+        """The next per-event cap after the summarizer call failed.
+
+        Chosen so the rendered total -- not just the longest event -- falls to
+        ``hard_context_reset_context_scaling`` of what was just sent: scaling the
+        longest event alone leaves every shorter one untouched, so a prompt made
+        of many mid-sized events is re-sent almost unchanged. Returns 0 when no
+        positive cap gets there, i.e. there is nothing left to cut.
+        """
+        lengths = [
+            len(text)
+            for text in self._render_forgotten_events(events, max_event_str_length)
+        ]
+        target = sum(lengths) * self.hard_context_reset_context_scaling
+        # The largest cap whose capped total fits the target (capping never grows
+        # an event, so the total is monotonic in the cap).
+        low, high = 0, max(lengths)
+        while low < high:
+            cap = (low + high + 1) // 2
+            if sum(min(length, cap) for length in lengths) <= target:
+                low = cap
+            else:
+                high = cap - 1
+        return low
+
+    def _summarize(
+        self, forgotten_events: Sequence[LLMConvertibleEvent], summary_offset: int
+    ) -> Condensation:
+        """Summarize the forgotten events whole; shrink them only on overflow.
+
+        Whole events can exceed a summarizer whose window is smaller than the
+        agent's. Rather than fail -- and fall through to a hard context reset that
+        forgets everything -- retry with every event cut further each time. Any
+        other failure is raised at once.
+        """
+        max_event_str_length: int | None = None
+        for _ in range(self.hard_context_reset_max_retries):
+            try:
+                return self._generate_condensation(
+                    forgotten_events=forgotten_events,
+                    summary_offset=summary_offset,
+                    max_event_str_length=max_event_str_length,
+                )
+            except NoCondensationAvailableException as e:
+                cause = e.__cause__
+                if not isinstance(cause, Exception) or not is_context_window_exceeded(
+                    cause
+                ):
+                    raise
+                max_event_str_length = self._shrunk_event_length(
+                    forgotten_events, max_event_str_length
+                )
+                if max_event_str_length <= 0:
+                    raise NoCondensationAvailableException(
+                        "Summarizer context exceeded with nothing left to cut."
+                    ) from e
+                logger.warning(
+                    "Summarizer context exceeded; retrying with each event cut to "
+                    f"{max_event_str_length} characters."
+                )
+        raise NoCondensationAvailableException(
+            "Summarizer context exceeded at every event length tried."
+        )
+
+    async def _asummarize(
+        self, forgotten_events: Sequence[LLMConvertibleEvent], summary_offset: int
+    ) -> Condensation:
+        """Async variant of :meth:`_summarize`."""
+        max_event_str_length: int | None = None
+        for _ in range(self.hard_context_reset_max_retries):
+            try:
+                return await self._agenerate_condensation(
+                    forgotten_events=forgotten_events,
+                    summary_offset=summary_offset,
+                    max_event_str_length=max_event_str_length,
+                )
+            except NoCondensationAvailableException as e:
+                cause = e.__cause__
+                if not isinstance(cause, Exception) or not is_context_window_exceeded(
+                    cause
+                ):
+                    raise
+                max_event_str_length = self._shrunk_event_length(
+                    forgotten_events, max_event_str_length
+                )
+                if max_event_str_length <= 0:
+                    raise NoCondensationAvailableException(
+                        "Summarizer context exceeded with nothing left to cut."
+                    ) from e
+                logger.warning(
+                    "Summarizer context exceeded; retrying with each event cut to "
+                    f"{max_event_str_length} characters."
+                )
+        raise NoCondensationAvailableException(
+            "Summarizer context exceeded at every event length tried."
+        )
+
     def _generate_condensation(
         self,
         forgotten_events: Sequence[LLMConvertibleEvent],
@@ -244,11 +375,9 @@ class LLMSummarizingCondenser(RollingCondenser):
         """
         assert len(forgotten_events) > 0, "No events to condense."
 
-        # Convert events to strings for the template
-        event_strings = [
-            maybe_truncate(str(forgotten_event), truncate_after=max_event_str_length)
-            for forgotten_event in forgotten_events
-        ]
+        event_strings = self._render_forgotten_events(
+            forgotten_events, max_event_str_length
+        )
 
         messages = self._build_summary_messages(event_strings)
 
@@ -382,15 +511,10 @@ class LLMSummarizingCondenser(RollingCondenser):
                     max_event_str_length=max_event_str_length,
                 )
             except Exception as e:
-                # If we haven't set a max_event_str_length yet, set it as the largest
-                # event string length.
-                if max_event_str_length is None:
-                    max_event_str_length = max(len(str(event)) for event in view.events)
-
-                # Since the summarization failed, reduce the max_event_str_length by 20%
-                assert max_event_str_length is not None
-                max_event_str_length = int(
-                    max_event_str_length * self.hard_context_reset_context_scaling
+                # Since the summarization failed, cut every event to 80% of the
+                # longest one as rendered -- not of its 500-character preview.
+                max_event_str_length = max(
+                    1, self._shrunk_event_length(forgotten_events, max_event_str_length)
                 )
 
                 # Log the exception so we can track these failures
@@ -433,10 +557,7 @@ class LLMSummarizingCondenser(RollingCondenser):
                 "threshold."
             )
 
-        return self._generate_condensation(
-            forgotten_events=forgotten_events,
-            summary_offset=summary_offset,
-        )
+        return self._summarize(forgotten_events, summary_offset)
 
     # ------------------------------------------------------------------
     # Async variants
@@ -451,10 +572,9 @@ class LLMSummarizingCondenser(RollingCondenser):
         """Async variant of :meth:`_generate_condensation`."""
         assert len(forgotten_events) > 0, "No events to condense."
 
-        event_strings = [
-            maybe_truncate(str(fe), truncate_after=max_event_str_length)
-            for fe in forgotten_events
-        ]
+        event_strings = self._render_forgotten_events(
+            forgotten_events, max_event_str_length
+        )
 
         messages = self._build_summary_messages(event_strings)
 
@@ -505,10 +625,7 @@ class LLMSummarizingCondenser(RollingCondenser):
                 "progress threshold."
             )
 
-        return await self._agenerate_condensation(
-            forgotten_events=forgotten_events,
-            summary_offset=summary_offset,
-        )
+        return await self._asummarize(forgotten_events, summary_offset)
 
     async def ahard_context_reset(
         self,
@@ -533,11 +650,8 @@ class LLMSummarizingCondenser(RollingCondenser):
                     max_event_str_length=max_event_str_length,
                 )
             except Exception as e:
-                if max_event_str_length is None:
-                    max_event_str_length = max(len(str(ev)) for ev in view.events)
-                assert max_event_str_length is not None
-                max_event_str_length = int(
-                    max_event_str_length * self.hard_context_reset_context_scaling
+                max_event_str_length = max(
+                    1, self._shrunk_event_length(forgotten_events, max_event_str_length)
                 )
                 logger.warning(
                     f"Hard context reset summarization failed: {e}. "

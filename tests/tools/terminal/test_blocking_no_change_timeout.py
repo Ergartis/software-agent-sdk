@@ -111,5 +111,5 @@ class TestWhatTheAgentIsTold:
         msg = BLOCKED_NO_OUTPUT_MESSAGE_TEMPLATE
         assert "stdin" in msg
         assert "no interactive user" in msg
-        assert "C-c" in msg          # how to get out
+        assert "C-c" in msg  # how to get out
         assert "CHANGE APPROACH" in msg  # and what to do instead

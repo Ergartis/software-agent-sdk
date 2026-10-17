@@ -30,6 +30,7 @@ import pytest
 from openhands.sdk.agent import Agent
 from openhands.sdk.conversation import Conversation
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
+from openhands.sdk.event import MessageEvent
 from openhands.sdk.llm import ImageContent, Message, MessageToolCall, TextContent
 from openhands.sdk.testing import TestLLM
 from openhands.sdk.tool import (
@@ -143,8 +144,8 @@ def _user_texts(convo: LocalConversation) -> list[str]:
     return [
         c.text
         for e in convo.state.events
-        if getattr(e, "llm_message", None) and e.llm_message.role == "user"
-        for c in getattr(e.llm_message, "content", [])
+        if isinstance(e, MessageEvent) and e.llm_message.role == "user"
+        for c in e.llm_message.content
         if isinstance(c, TextContent)
     ]
 
@@ -238,7 +239,7 @@ def _scripted_conversation(
 ) -> LocalConversation:
     tool = _ProbeTool.create(executor=_SendingExecutor(convo_box, probe, messages))[0]
     register_tool("probe_tool", tool)
-    agent = Agent(llm=TestLLM.from_messages(script), tools=[Tool(name="probe_tool")])
+    agent = Agent(llm=TestLLM.from_messages([*script]), tools=[Tool(name="probe_tool")])
     convo = Conversation(agent=agent, **kwargs)
     assert isinstance(convo, LocalConversation)
     convo_box.append(convo)

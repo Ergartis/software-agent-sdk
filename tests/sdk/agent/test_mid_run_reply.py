@@ -261,7 +261,7 @@ def _bury_under_tool_traffic(conversation: LocalConversation) -> None:
     the next step looks at the log.
     """
     from openhands.sdk.event import ActionEvent
-    from openhands.sdk.llm import TextContent as _TC
+    from openhands.sdk.llm import MessageToolCall, TextContent as _TC
     from openhands.sdk.tool.builtins.finish import FinishAction
 
     with conversation._state:
@@ -272,13 +272,12 @@ def _bury_under_tool_traffic(conversation: LocalConversation) -> None:
                 action=FinishAction(message="x"),
                 tool_name="finish",
                 tool_call_id="call-1",
-                tool_call={
-                    "id": "call-1",
-                    "type": "function",
-                    "name": "finish",
-                    "arguments": "{}",
-                    "origin": "completion",
-                },
+                tool_call=MessageToolCall(
+                    id="call-1",
+                    name="finish",
+                    arguments="{}",
+                    origin="completion",
+                ),
                 llm_response_id="resp-1",
             )
         )

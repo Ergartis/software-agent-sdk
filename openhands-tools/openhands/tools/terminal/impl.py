@@ -106,6 +106,12 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         self._sessions: dict[int, TerminalSession] = {}
         self._sessions_lock = threading.Lock()
         self._pool_recovery_lock = threading.Lock()
+        # The pane whose command outlived its soft timeout and is still running.
+        # It stays checked out of the pool so the next call cannot interrupt it,
+        # and a follow-up (empty command or is_input) is routed back to it — the
+        # "send '' to keep waiting" contract every timeout observation offers.
+        self._held: PooledTmuxTerminal | None = None
+        self._held_lock = threading.Lock()
 
         use_pool = terminal_type in (None, "tmux") and _is_tmux_available()
 
@@ -165,6 +171,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 failed_pool.close()
             with self._sessions_lock:
                 self._sessions.clear()
+            self._held = None
             self._initialize_pool()
 
     @staticmethod
@@ -469,6 +476,70 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
 
         return self._mask_observation(observation, conversation)
 
+    _STILL_RUNNING = (
+        TerminalCommandStatus.NO_CHANGE_TIMEOUT,
+        TerminalCommandStatus.HARD_TIMEOUT,
+        TerminalCommandStatus.CONTINUE,
+    )
+
+    def _release_terminal(self, terminal: PooledTmuxTerminal) -> None:
+        """Interrupt whatever *terminal* still runs and return it to the pool."""
+        pool = self._pool
+        assert pool is not None
+        if not terminal._closed:
+            with suppress(Exception):
+                self._prepare_pooled_session(self._wrap_session(terminal))
+        pool.checkin(terminal)
+
+    def _hold(self, terminal: PooledTmuxTerminal) -> None:
+        """Keep *terminal* out of the pool: its command is still running.
+
+        Only one pane is held. A second command that also outlives its soft
+        timeout takes the slot, and the older one is interrupted and returned —
+        the same outcome the single-session terminal gives, where a new command
+        cannot start until the running one is dealt with.
+        """
+        with self._held_lock:
+            previous, self._held = self._held, terminal
+        if previous is not None and previous is not terminal:
+            self._release_terminal(previous)
+
+    def _release_held(self) -> None:
+        with self._held_lock:
+            held, self._held = self._held, None
+        if held is not None:
+            self._release_terminal(held)
+
+    def _continue_held(
+        self,
+        action: TerminalAction,
+        conversation: "LocalConversation | None",
+    ) -> TerminalObservation | None:
+        """Route a follow-up (``''`` or ``is_input``) to the still-running pane.
+
+        Returns None when nothing is held, so the caller falls back to a fresh
+        pane, where the session answers "No previous running command" exactly as
+        before. The lock is held for the whole call: follow-ups to one process
+        are sequential by nature, and it keeps ``_hold`` from swapping the pane
+        out from under a read.
+        """
+        pool = self._pool
+        assert pool is not None
+        with self._held_lock:
+            terminal = self._held
+            if terminal is None:
+                return None
+            if terminal._closed:
+                self._held = None
+                pool.checkin(terminal)
+                return None
+            session = self._wrap_session(terminal)
+            observation = session.execute(action)
+            if session.prev_status not in self._STILL_RUNNING:
+                self._held = None
+                pool.checkin(terminal)
+        return self._mask_observation(observation, conversation)
+
     def _execute_pooled(
         self,
         action: TerminalAction,
@@ -476,19 +547,32 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     ) -> TerminalObservation:
         """Execute *action* in pool mode with proper checkout/checkin.
 
-        All pane lifecycle (checkout, optional replace, checkin) is
-        managed by the pool's context manager so there is exactly one
-        checkout and one checkin per call.
+        Every call checks out a pane and checks it back in, with one exception:
+        a pane whose command outlived its soft timeout stays checked out (held)
+        until the command finishes, is interrupted, or another timed-out command
+        replaces it. Upstream returned it to the pool, and the next checkout sent
+        C-c to it — so the timeout observation's own advice ("send '' to wait")
+        killed the command, and an agent told to wait for a quiet 2-minute step
+        could never get past it.
         """
         pool = self._pool
         assert pool is not None
         try:
-            with pool.pane() as handle:
+            if not action.reset and (action.is_input or action.command == ""):
+                continued = self._continue_held(action, conversation)
+                if continued is not None:
+                    return continued
+            if action.reset:
+                self._release_held()
+
+            terminal = pool.checkout()
+            keep = False
+            try:
                 reset_text: str | None = None
 
-                if action.reset or handle.terminal._closed:
-                    self._discard_session(handle.terminal)
-                    handle.terminal = pool.replace(handle.terminal)
+                if action.reset or terminal._closed:
+                    self._discard_session(terminal)
+                    terminal = pool.replace(terminal)
                     reset_text = self._RESET_TEXT
                     logger.info(
                         "Terminal pane replaced (reset) "
@@ -502,7 +586,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                             exit_code=0,
                         )
 
-                session = self._wrap_session(handle.terminal)
+                session = self._wrap_session(terminal)
                 self._prepare_pooled_session(session)
 
                 cmd_action = (
@@ -517,6 +601,16 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 self._export_envs(cmd_action, conversation, session=session)
                 observation = session.execute(cmd_action)
 
+                if session.prev_status in self._STILL_RUNNING:
+                    # A command that ended the shell (`exit`) also looks "still
+                    # running": the prompt never came back. Ask tmux whether the
+                    # pane exists before holding it, so a dead server raises here
+                    # and takes the recovery path below. (Upstream reached that
+                    # path only through checkin's debug log formatting the pane.)
+                    terminal.pane.refresh()
+                    keep = True
+                    self._hold(terminal)
+
                 if reset_text is not None:
                     observation = observation.model_copy(
                         update={
@@ -528,6 +622,9 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     )
 
                 return self._mask_observation(observation, conversation)
+            finally:
+                if not keep:
+                    pool.checkin(terminal)
         except Exception as error:
             if not self._is_recoverable_tmux_pool_error(error):
                 raise
@@ -597,6 +694,7 @@ class TerminalExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     def close(self) -> None:
         """Close the terminal session and clean up resources."""
         if self._pool is not None:
+            self._held = None
             self._pool.close()
             with self._sessions_lock:
                 self._sessions.clear()

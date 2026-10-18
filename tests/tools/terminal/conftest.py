@@ -17,6 +17,7 @@ logger = get_logger(__name__)
 _WINDOWS_UNSUPPORTED_BACKEND_TEST_MODULES = {
     "test_conversation_cleanup.py",
     "test_large_environment.py",
+    "test_pool_held_pane.py",
     "test_pool_integration.py",
     "test_schema.py",
     "test_secrets_masking.py",
